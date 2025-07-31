@@ -50,6 +50,32 @@ def get_info(
         The partitioned output dimension for the FC layer.
     """
     #TODO: Your code here
+
+    mp_idx = rank % mp_size  # Model parallel index
+    dp_idx = rank // mp_size  # Data parallel index
+    
+    color_mp = dp_idx  # Color for model parallel communicator
+    mp_comm = comm.Split(color=color_mp, key=mp_idx)
+    
+    color_dp = mp_idx
+    dp_comm = comm.Split(color=color_dp, key=dp_idx)
+    
+    # X (input): [batch_size, seq_length, in_dim] 
+    # W_q, W_k, W_v (weights): [in_dim, in_dim]
+    # Q = X @ W_q, K = X @ W_k, V = X @ W_v: [batch_size, seq_length, H, head_dim] (in_dim = H * head_dim for multi-head attention)
+    # scores = Q @ K.transpose(-1, -2) / sqrt(D_head)  # [batch_size, H, seq_length, seq_length]
+    # A = softmax(scores, dim=-1) # [batch_size, H, seq_length, seq_length]
+    # Z = A @ V  # [batch_size, H, seq_length, head_dim] --transpose&reshape--> [batch_size, seq_length, in_dim]
+    # W_o (weight): [in_dim, out_dim]
+    # O = Z @ W_o: [batch_size, seq_length, out_dim]
+
+    if fc_layer in ["fc_q", "fc_k", "fc_v"]:
+        part_in_dim = in_dim
+        part_out_dim = out_dim // mp_size # for broadcast
+    elif fc_layer == "fc_o":
+        part_in_dim = in_dim // mp_size # for all-reduce
+        part_out_dim = out_dim
+    
     return mp_idx, dp_idx, mp_comm, dp_comm, part_in_dim, part_out_dim
 
 def naive_collect_forward_input(
@@ -66,6 +92,14 @@ def naive_collect_forward_input(
       (batch_size, seq_length, part_in_dim * mp_size)
     """
     #TODO: Your code here
+    x = np.ascontiguousarray(x)
+    collected_x = np.empty((mp_size, x.shape[0], x.shape[1], x.shape[2]), dtype=x.dtype)
+    mp_comm.Allgather([x, MPI.FLOAT], [collected_x, MPI.FLOAT])
+    collected_x = np.transpose(collected_x, (1, 2, 0, 3))
+    
+    # 合併最後兩個維度：(batch, seq, mp_size, part_dim) -> (batch, seq, mp_size * part_dim)
+    collected_x = collected_x.reshape(x.shape[0], x.shape[1], -1)
+
     return collected_x
 
 
@@ -83,6 +117,13 @@ def naive_collect_forward_output(
       (batch_size, seq_length, part_out_dim * mp_size)
     """
     #TODO: Your code here
+    out = np.ascontiguousarray(out) # to solve: FAILED tests/test_transformer_forward.py::test_fc_o_naive_mp_forward_x_3d - BufferError: dlpack: buffer is not contiguous
+    collected_out = np.empty((mp_size, out.shape[0], out.shape[1], out.shape[2]), dtype=out.dtype)
+    mp_comm.Allgather([out, MPI.FLOAT], [collected_out, MPI.FLOAT])
+    # 重新排列維度並合併
+    collected_out = np.transpose(collected_out, (1, 2, 0, 3))
+    collected_out = collected_out.reshape(out.shape[0], out.shape[1], -1)
+
     return collected_out
 
 def naive_collect_backward_output(
@@ -116,6 +157,12 @@ def naive_collect_backward_output(
         (batch_size, seq_length, out_dim // mp_size).
     """
     #TODO: Your code here
+    part_out_dim = output_grad.shape[2] // mp_size
+    start_idx = mp_group_idx * part_out_dim
+    end_idx = start_idx + part_out_dim
+    collected_output_grad = output_grad[:, :, start_idx:end_idx]
+    return collected_output_grad
+    
 
 
 def naive_collect_backward_x(
@@ -151,3 +198,11 @@ def naive_collect_backward_x(
         (batch_size, seq_length, in_dim // mp_size).
     """
     #TODO: Your code here
+    part_in_dim = grad_x.shape[2] // mp_size
+    collected_grad_x = np.empty((grad_x.shape[0], grad_x.shape[1], part_in_dim), dtype=grad_x.dtype)
+    grad_x_reshaped = grad_x.reshape(grad_x.shape[0], grad_x.shape[1], mp_size, part_in_dim)
+    grad_x_reshaped_transpose = np.transpose(grad_x_reshaped, (2, 0, 1, 3))  # (mp_size, batch_size, seq_length, part_in_dim)
+    grad_x_reshaped_transpose = np.ascontiguousarray(grad_x_reshaped_transpose)  # Ensure the array is contiguous
+    mp_comm.Reduce_scatter(grad_x_reshaped_transpose, collected_grad_x, op=MPI.SUM)
+
+    return collected_grad_x

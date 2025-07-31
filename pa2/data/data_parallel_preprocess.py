@@ -43,3 +43,13 @@ def split_data(
     """
 
     #TODO: Your code here
+    data_num = x_train.shape[0]
+    d_segment_size = data_num // dp_size
+    m_segment_size = d_segment_size // mp_size
+    
+    dp_ix = rank // mp_size  # Data parallel group index
+    mp_ix = rank % mp_size   # Model parallel rank within the group
+    
+    start_idx = dp_ix * d_segment_size
+    end_idx = start_idx + m_segment_size * mp_size # the model parallel groups can share the same data split within the same data parallel group.
+    return x_train[start_idx:end_idx], y_train[start_idx:end_idx]

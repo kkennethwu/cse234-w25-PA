@@ -74,6 +74,39 @@ class Communicator(object):
           - For the root process: (n-1) receives and (n-1) sends.
         """
         #TODO: Your code here
+        assert src_array.size == dest_array.size
+        src_array_byte = src_array.itemsize * src_array.size
+        
+        rank = self.Get_rank()
+        size = self.Get_size()
+        
+        # Count bytes for manual implementation: (size-1) sends + (size-1) receives
+        self.total_bytes_transferred += src_array_byte * 2 * (size - 1)
+        
+        root = 0
+        if rank == root:
+            # Root process
+            result = np.copy(src_array)
+            for r in range(1, size):
+                recv_buffer = np.empty_like(src_array)
+                self.comm.Recv(recv_buffer, source=r, tag=0)
+                if op == MPI.SUM:
+                    result += recv_buffer
+                elif op == MPI.PROD:
+                    result *= recv_buffer
+                elif op == MPI.MAX:
+                    result = np.maximum(result, recv_buffer)
+                elif op == MPI.MIN:
+                    result = np.minimum(result, recv_buffer)
+                
+            for r in range(1, size):  # Don't send to self
+                self.comm.Send(result, dest=r, tag=1)
+                
+            dest_array[:] = result
+        else:
+            # Non-root processes
+            self.comm.Send(src_array, dest=root, tag=0)
+            self.comm.Recv(dest_array, source=root, tag=1)
 
     def myAlltoall(self, src_array, dest_array):
         """
@@ -91,3 +124,20 @@ class Communicator(object):
         The total data transferred is updated for each pairwise exchange.
         """
         #TODO: Your code here
+        
+        rank = self.Get_rank()
+        size = self.Get_size()
+        segment_size = src_array.size // size
+        
+        for r in range(size):
+            if r == rank: # For the local segment (when destination == self), a direct copy is done.
+                dest_array[r * segment_size: (r + 1) * segment_size] = src_array[r * segment_size: (r + 1) * segment_size]
+            else:
+                self.comm.Sendrecv( # exchange the corresponding portion of its src_array with the other process via Sendrecv
+                    sendbuf=src_array[r * segment_size: (r + 1) * segment_size],
+                    dest=r,
+                    recvbuf=dest_array[r * segment_size: (r + 1) * segment_size],
+                    source=r
+                )
+        
+        
